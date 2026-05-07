@@ -22,7 +22,6 @@ import json
 import logging
 import os
 import random
-import sys
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Callable
 
@@ -399,71 +398,77 @@ class Proxy:
         request: dict,
         is_chat: bool,
     ) -> AsyncIterator[bytes]:
-        ensure_request_seed(request)
-
-        kv_prepare_request = request.copy()
-        kv_prepare_request["stream"] = True
-        kv_prepare_request["max_tokens"] = 1
-        if is_chat and "max_completion_tokens" in kv_prepare_request:
-            kv_prepare_request["max_completion_tokens"] = 1
-
-        prefill_instance = self.schedule(self.prefill_cycler)
-        prefill_text = None
         try:
-            prefill_chunks = self.forward_request(
-                f"http://{prefill_instance}{endpoint}", kv_prepare_request
-            )
-            async for event in iter_sse_events(prefill_chunks):
-                generated_text = extract_generated_text(event, is_chat)
-                if generated_text is not None and prefill_text is None:
-                    prefill_text = generated_text
-                    yield rewrite_prefill_event(event)
-                elif prefill_text is None and should_forward_prefill_preamble(
-                    event, is_chat
-                ):
-                    yield rewrite_prefill_event(event)
-        except HTTPException as http_exc:
-            self.remove_instance_endpoint("prefill", prefill_instance)
-            raise http_exc
+            ensure_request_seed(request)
 
-        decode_instance = self.schedule(self.decode_cycler)
-        try:
-            decode_chunks = self.forward_request(
-                f"http://{decode_instance}{endpoint}", request
-            )
-            if prefill_text is None:
-                logger.warning(
-                    "Prefill stream did not produce a generated text chunk; "
-                    "forwarding decode stream unchanged."
+            kv_prepare_request = request.copy()
+            kv_prepare_request["stream"] = True
+            kv_prepare_request["max_tokens"] = 1
+            if is_chat and "max_completion_tokens" in kv_prepare_request:
+                kv_prepare_request["max_completion_tokens"] = 1
+
+            prefill_instance = self.schedule(self.prefill_cycler)
+            prefill_text = None
+            try:
+                prefill_chunks = self.forward_request(
+                    f"http://{prefill_instance}{endpoint}", kv_prepare_request
                 )
-                async for chunk in decode_chunks:
-                    yield chunk
-                return
+                async for event in iter_sse_events(prefill_chunks):
+                    generated_text = extract_generated_text(event, is_chat)
+                    if generated_text is not None and prefill_text is None:
+                        prefill_text = generated_text
+                        yield rewrite_prefill_event(event)
+                    elif prefill_text is None and should_forward_prefill_preamble(
+                        event, is_chat
+                    ):
+                        yield rewrite_prefill_event(event)
+            except HTTPException as http_exc:
+                self.remove_instance_endpoint("prefill", prefill_instance)
+                raise http_exc
 
-            skipped_decode_text = None
-            async for event in iter_sse_events(decode_chunks):
-                generated_text = extract_generated_text(event, is_chat)
-                if generated_text is not None and skipped_decode_text is None:
-                    skipped_decode_text = generated_text
-                    if skipped_decode_text != prefill_text:
-                        logger.warning(
-                            "Prefill/decode first-token mismatch in demo "
-                            "streaming mode: prefill=%r decode=%r",
-                            prefill_text,
-                            skipped_decode_text,
+            decode_instance = self.schedule(self.decode_cycler)
+            try:
+                decode_chunks = self.forward_request(
+                    f"http://{decode_instance}{endpoint}", request
+                )
+                if prefill_text is None:
+                    logger.warning(
+                        "Prefill stream did not produce a generated text chunk; "
+                        "forwarding decode stream unchanged."
+                    )
+                    async for chunk in decode_chunks:
+                        yield chunk
+                    return
+
+                skipped_decode_text = None
+                async for event in iter_sse_events(decode_chunks):
+                    generated_text = extract_generated_text(event, is_chat)
+                    if generated_text is not None and skipped_decode_text is None:
+                        skipped_decode_text = generated_text
+                        if skipped_decode_text != prefill_text:
+                            logger.warning(
+                                "Prefill/decode first-token mismatch in demo "
+                                "streaming mode: prefill=%r decode=%r",
+                                prefill_text,
+                                skipped_decode_text,
+                            )
+                        terminal_event = rewrite_decode_terminal_event(
+                            event, is_chat
                         )
-                    terminal_event = rewrite_decode_terminal_event(event, is_chat)
-                    if terminal_event is not None:
-                        yield terminal_event
-                    continue
-                if skipped_decode_text is None:
-                    # Skip leading decode metadata already emitted from prefill,
-                    # e.g. the chat role chunk.
-                    continue
-                yield event
-        except HTTPException as http_exc:
-            self.remove_instance_endpoint("decode", decode_instance)
-            raise http_exc
+                        if terminal_event is not None:
+                            yield terminal_event
+                        continue
+                    if skipped_decode_text is None:
+                        # Skip leading decode metadata already emitted from
+                        # prefill, e.g. the chat role chunk.
+                        continue
+                    yield event
+            except HTTPException as http_exc:
+                self.remove_instance_endpoint("decode", decode_instance)
+                raise http_exc
+        except Exception:
+            logger.exception("stream_prefill_then_decode failed")
+            raise
 
     async def create_completion(self, raw_request: Request):
         try:
@@ -503,11 +508,8 @@ class Proxy:
             response = StreamingResponse(generator)
             return response
         except Exception:
-            import sys
-
-            exc_info = sys.exc_info()
-            print("Error occurred in disagg proxy server")
-            print(exc_info)
+            logger.exception("Error occurred in disagg proxy server")
+            raise
 
     async def create_chat_completion(self, raw_request: Request):
         try:
@@ -552,13 +554,8 @@ class Proxy:
             response = StreamingResponse(content=generator)
             return response
         except Exception:
-            exc_info = sys.exc_info()
-            error_messages = [str(e) for e in exc_info if e]
-            print("Error occurred in disagg proxy server")
-            print(error_messages)
-            return StreamingResponse(
-                content=iter(error_messages), media_type="text/event-stream"
-            )
+            logger.exception("Error occurred in disagg proxy server")
+            raise
 
     def remove_instance_endpoint(self, instance_type, instance):
         if instance_type == "decode" and instance in self.decode_instances:
